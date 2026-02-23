@@ -84,7 +84,7 @@ def train(args, train_loader, model, criterion, optimizer, epoch,scaler,verbose=
             ema.update(model)
         if verbose:
             pbar.set_description(('%13s' * 1 + '%13.4g' * 3) %
-                                     (f'{epoch}/{300 - 1}', tversky_loss, focal_loss, loss.item()))
+                                     (f'{epoch+1}/{args.max_epochs}', tversky_loss, focal_loss, loss.item()))
     return ema if ema is not None else None
 
 
