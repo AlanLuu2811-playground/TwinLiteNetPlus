@@ -1,4 +1,5 @@
 chanel_img = 3
+stacked_convs = 6
 sc_ch_dict = {
     "nano": {  'p': 1,
             'q': 1,

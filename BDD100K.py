@@ -270,10 +270,10 @@ class Dataset(torch.utils.data.Dataset):
         self.Tensor = transforms.ToTensor()
         self.valid=valid
         if valid:
-            self.root='../bdd100k/images/val'
+            self.root='./bdd100k/images/val'
             self.names=os.listdir(self.root)
         else:
-            self.root='../bdd100k/images/train'
+            self.root='./bdd100k/images/train'
             self.names=os.listdir(self.root)
 
     def __len__(self):

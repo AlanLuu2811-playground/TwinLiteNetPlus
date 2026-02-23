@@ -1,0 +1,8 @@
+bdd100k
+pretrained
+testv3
+
+__pycache__
+*.pyc
+*.pkl
+*.log

@@ -1,4 +1,6 @@
+from typing import Optional
 import torch
+from torch import Tensor
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
@@ -128,7 +130,7 @@ class ConvBatchnormRelu(nn.Module):
     This class defines the convolution layer with batch normalization and PReLU activation
     '''
 
-    def __init__(self, nIn, nOut, kSize=3, stride=1, groups=1,dropout_rate=0.0):
+    def __init__(self, nIn, nOut, kSize=3, stride=1, groups=1,dropout_rate=0.0, padding=None):
         '''
 
         :param nIn: number of input channels
@@ -137,7 +139,8 @@ class ConvBatchnormRelu(nn.Module):
         :param stride: stride rate for down-sampling. Default is 1
         '''
         super().__init__()
-        padding = int((kSize - 1) / 2)
+        if padding is None:
+            padding = int((kSize - 1) / 2)
         self.conv = nn.Conv2d(nIn, nOut, kSize, stride=stride, padding=padding, bias=False, groups=groups)
         self.bn = nn.BatchNorm2d(nOut)
         self.act = nn.PReLU(nOut)
@@ -480,6 +483,71 @@ class SingleLiteNetPlus(nn.Module):
 
         return out
 
+class TaskDecomposition(nn.Module):
+    """Task decomposition module in task-aligned predictor of TOOD.
+
+    Args:
+        feat_channels (int): Number of feature channels in TOOD head.
+        stacked_convs (int): Number of conv layers in TOOD head.
+        la_down_rate (int): Downsample rate of layer attention.
+            Defaults to 8.
+        conv_cfg (:obj:`ConfigDict` or dict, optional): Config dict for
+            convolution layer. Defaults to None.
+        norm_cfg (:obj:`ConfigDict` or dict, optional):  Config dict for
+        normalization layer. Defaults to None.
+    """
+
+    def __init__(self,
+                 feat_channels: int,
+                 stacked_convs: int,
+                 la_down_rate: int = 8) -> None:
+        super().__init__()
+        self.feat_channels = feat_channels
+        self.stacked_convs = stacked_convs
+        self.in_channels = self.feat_channels * self.stacked_convs
+        self.layer_attention = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.in_channels // la_down_rate, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                self.in_channels // la_down_rate,
+                self.stacked_convs,
+                1,
+                padding=0),
+            nn.Sigmoid())
+
+        self.reduction_conv = ConvBatchnormRelu(
+            self.in_channels,
+            self.feat_channels,
+            1,
+            stride=1,
+            padding=0)
+
+    def forward(self,
+                feat: Tensor,
+                avg_feat: Optional[Tensor] = None) -> Tensor:
+        """Forward function of task decomposition module."""
+        b, c, h, w = feat.shape
+        if avg_feat is None:
+            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+        weight = self.layer_attention(avg_feat)
+
+        # here we first compute the product between layer attention weight and
+        # conv weight, and then compute the convolution between new conv weight
+        # and feature map, in order to save memory and FLOPs.
+        conv_weight = weight.reshape(
+            b, 1, self.stacked_convs,
+            1) * self.reduction_conv.conv.weight.reshape(
+                1, self.feat_channels, self.stacked_convs, self.feat_channels)
+        conv_weight = conv_weight.reshape(b, self.feat_channels,
+                                          self.in_channels)
+        feat = feat.reshape(b, self.in_channels, h * w)
+        feat = torch.bmm(conv_weight, feat).reshape(b, self.feat_channels, h,
+                                                    w)
+        feat = self.reduction_conv.bn(feat)
+        feat = self.reduction_conv.act(feat)
+
+        return feat
+
 class TwinLiteNetPlus(nn.Module):
     '''
     This class defines the ESPNet network
@@ -493,6 +561,18 @@ class TwinLiteNetPlus(nn.Module):
         self.encoder = Encoder(args.config)
         self.sigle_ll = False
         self.sigle_da = False
+        self.stacked_convs = cfg.stacked_convs
+        self.feat_channels = cfg.sc_ch_dict[args.config]['chanels'][1]
+        self.in_channels = cfg.sc_ch_dict[args.config]['chanels'][1]
+
+        self.da_decomp = TaskDecomposition(
+            self.feat_channels,
+            self.stacked_convs,
+            self.stacked_convs*8)
+        self.ll_decomp = TaskDecomposition(
+            self.feat_channels,
+            self.stacked_convs,
+            self.stacked_convs*8)
 
         self.caam = CAAM(feat_in=cfg.sc_ch_dict[args.config]['chanels'][2], num_classes=cfg.sc_ch_dict[args.config]['chanels'][2],bin_size =(2,4), norm_layer=nn.BatchNorm2d)
         self.conv_caam = ConvBatchnormRelu(cfg.sc_ch_dict[args.config]['chanels'][2],cfg.sc_ch_dict[args.config]['chanels'][1])
@@ -505,24 +585,42 @@ class TwinLiteNetPlus(nn.Module):
         self.up_2_ll = UpConvBlock(cfg.sc_ch_dict[args.config]['chanels'][0],8) #out: Hx2, Wx2
         self.out_ll = UpConvBlock(8,2,last=True)
 
+        self.inter_convs = nn.ModuleList()
+        for i in range(self.stacked_convs):
+            chn = self.in_channels if i == 0 else self.feat_channels
+            self.inter_convs.append(
+                ConvBatchnormRelu(chn, self.feat_channels, 3, stride=1, padding=1))
+
 
     def forward(self, input):
         '''
         :param input: RGB image
         :return: transformed feature map
         '''
-        out_encoder,inp1,inp2=self.encoder(input)
+        out_encoder, inp1, inp2 = self.encoder(input)
         #visualize_feature_map_subset(out_encoder, "outencoder", 128)
 
-        out_caam=self.caam(out_encoder)
-        out_caam=self.conv_caam(out_caam)
+        out_caam = self.caam(out_encoder)
+        out_caam = self.conv_caam(out_caam)
 
-        out_da=self.up_1_da(out_caam,inp2)
-        out_da=self.up_2_da(out_da,inp1)
+        inter_feats = []
+        for i, inter_conv in enumerate(self.inter_convs):
+            x = out_caam if i == 0 else x
+            x = inter_conv(x)
+            inter_feats.append(x)
+        feat = torch.cat(inter_feats, 1)
+
+        # task decomposition
+        avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+        da_ft = self.da_decomp(feat, avg_feat)
+        ll_ft = self.ll_decomp(feat, avg_feat)
+
+        out_da=self.up_1_da(da_ft, inp2)
+        out_da=self.up_2_da(out_da, inp1)
         out_da=self.out_da(out_da)
 
-        out_ll=self.up_1_ll(out_caam,inp2)
-        out_ll=self.up_2_ll(out_ll,inp1)
+        out_ll=self.up_1_ll(ll_ft, inp2)
+        out_ll=self.up_2_ll(out_ll, inp1)
         out_ll=self.out_ll(out_ll)
 
 
